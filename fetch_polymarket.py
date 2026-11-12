@@ -119,6 +119,29 @@ def detect_kind(ms, title=""):
     return "dist"
 
 
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june",
+     "july", "august", "september", "october", "november", "december"])}
+RE_DATE = re.compile(r'(january|february|march|april|may|june|july|august|september|'
+                     r'october|november|december)\s+(\d{1,2})(?:,?\s*(\d{4}))?', re.I)
+
+
+def date_key(s):
+    """把 'December 31' / 'March 31, 2027' 这类档位名转成可排序的 (年,月,日)。
+    没有年份的按『未来最近一次』推断（月份早于当月就算明年）。"""
+    m = RE_DATE.search(s or "")
+    if not m:
+        return (9999, 13, 32)
+    mon = MONTHS[m.group(1).lower()]
+    day = int(m.group(2))
+    if m.group(3):
+        yr = int(m.group(3))
+    else:
+        now = time.gmtime()
+        yr = now.tm_year + (1 if mon < now.tm_mon else 0)
+    return (yr, mon, day)
+
+
 # Polymarket 有一类未公开选项用占位符，价格恒为 50%，是噪声不是信号
 PLACEHOLDER = re.compile(r'^(candidate|company|option|team|person|entity|model)\s+[a-z0-9]{1,2}$', re.I)
 
@@ -217,7 +240,8 @@ def main():
         kind = detect_kind(mkts, title)
         if kind == "dist":
             mkts.sort(key=lambda x: -(x["prob"] or 0))
-        # ladder / single 保持接口原始顺序（即日期或阈值升序）
+        elif kind == "ladder":
+            mkts.sort(key=lambda x: date_key(x.get("sub") or ""))
         out.append({
             "id": e.get("id"),
             "title": title,
