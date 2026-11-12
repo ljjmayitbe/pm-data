@@ -101,19 +101,26 @@ def classify(text):
     return None, None
 
 
-def detect_kind(ms):
-    """dist=互斥档位分布；ladder=按截止日的累计概率；single=单一二项"""
+def detect_kind(ms, title=""):
+    """dist=互斥档位(概率和≈100)  ladder=按截止日/阈值的累计概率  single=单一二项"""
     if len(ms) <= 1:
         return "single"
-    subs = [(m.get("sub") or "") for m in ms]
-    hit = sum(1 for s in subs if re.search(DATE_RE, s.lower()))
-    if hit >= max(3, int(len(subs) * 0.6)):
-        probs = [m["prob"] for m in ms if m["prob"] is not None]
-        if len(probs) >= 3:
-            inc = sum(1 for a, b in zip(probs, probs[1:]) if b >= a - 1.0)
-            if inc >= len(probs) - 2:
-                return "ladder"
+    probs = [m["prob"] for m in ms if m["prob"] is not None]
+    if len(probs) < 2:
+        return "single"
+    total = sum(probs)
+    t = " " + title.lower() + " "
+    # 「... by <日期>」句式 = 到某日之前发生的累计概率
+    if (" by " in t or "by..." in t or "by…" in t or "before " in t) and len(probs) >= 2:
+        return "ladder"
+    # 概率和远超 100% 说明是「超过某阈值」的累计
+    if total > 130:
+        return "ladder"
     return "dist"
+
+
+# Polymarket 有一类未公开选项用占位符，价格恒为 50%，是噪声不是信号
+PLACEHOLDER = re.compile(r'^(candidate|company|option|team|person|entity|model)\s+[a-z0-9]{1,2}$', re.I)
 
 
 def parse_market(m, event_title):
@@ -202,14 +209,15 @@ def main():
             pm = parse_market(m, title)
             if pm["prob"] is None:
                 continue
+            if pm.get("sub") and PLACEHOLDER.match(pm["sub"].strip()):
+                continue  # 未公开选项的 50% 占位值
             mkts.append(pm)
         if not mkts:
             continue
-        kind = detect_kind(mkts)
+        kind = detect_kind(mkts, title)
         if kind == "dist":
             mkts.sort(key=lambda x: -(x["prob"] or 0))
-        else:
-            mkts.sort(key=lambda x: (x.get("ends") or "9999"))
+        # ladder / single 保持接口原始顺序（即日期或阈值升序）
         out.append({
             "id": e.get("id"),
             "title": title,
