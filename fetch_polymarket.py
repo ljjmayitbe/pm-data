@@ -340,6 +340,9 @@ def is_relevant(gid, title):
     if gid in ('fed', 'equity', 'commodity'):
         return True
     t = ' ' + title.lower() + ' '
+    # 自然灾害/天气类：与 A 股投资决策无关
+    if any(k in t for k in ('cyclone', 'hurricane', 'earthquake', 'typhoon', 'wildfire')):
+        return False
     # 俄罗斯/乌克兰/北约：只有牵涉能源才留
     if any(k in t for k in ('russia', 'ukraine', 'kyiv', 'putin', 'nato')):
         return any(k in t for k in (' oil', 'diesel', 'energy', 'gas'))
