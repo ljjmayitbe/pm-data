@@ -3,7 +3,7 @@
 Polymarket 事件概率抓取（在 GitHub Actions 的境外机器上运行）
 输出 data/latest.json + data/history/YYYY-MM-DD_HHMM.json
 """
-import os, sys, json, time
+import os, sys, json, time, re
 from datetime import datetime, timezone
 
 import requests
@@ -12,22 +12,34 @@ GAMMA = "https://gamma-api.polymarket.com"
 UA = {"User-Agent": "pm-monitor/1.0 (+github actions)"}
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-# 分类关键词（命中即归类，顺序即优先级）
+# 白名单式分类：只保留明确跟金融决策相关的事件，其余（体育/电竞/娱乐）直接丢弃
 GROUPS = [
-    ("fed",   "美联储与利率", ["fed ", "federal reserve", "fomc", "powell", "rate cut",
-                             "rate hike", "interest rate", "basis point", "bps"]),
-    ("macro", "通胀与就业",   ["cpi", "inflation", "unemployment", "jobs report", "payroll",
-                             "recession", "gdp", "pce", "jobless"]),
-    ("ai",    "美股与 AI",    ["nvidia", "openai", "anthropic", "apple", "tesla", "microsoft",
-                             "alphabet", "amazon", "meta ", "s&p", "nasdaq", "earnings",
-                             "ipo ", "market cap", "stock"]),
-    ("cmdty", "大宗商品",     ["gold", "silver", "oil", "crude", "copper", "opec",
-                             "natural gas", "wheat", "corn"]),
-    ("geo",   "地缘与政策",   ["china", "taiwan", "russia", "ukraine", "tariff", "war ",
-                             "invade", "ceasefire", "sanction", "election", "trump",
-                             "government shutdown"]),
-    ("crypto", "加密",        ["bitcoin", "ethereum", "btc", "eth ", "crypto", "solana",
-                             "stablecoin", "xrp"]),
+    ("fed", "美联储与利率", [
+        "fed ", "fed'", "fomc", "federal reserve", "powell", "rate cut", "rate hike",
+        "interest rate", "basis point", "bps ", "rate decision"]),
+    ("infl", "通胀与就业", [
+        "cpi", "inflation", "pce ", "unemployment", "jobless", "payroll",
+        "recession", "gdp", "jobs report", "economic data"]),
+    ("equity", "美股与科技", [
+        "nvidia", "openai", "anthropic", "apple", "tesla", "microsoft", "alphabet",
+        "amazon", "meta platforms", "s&p", "nasdaq", "dow jones", "market cap",
+        " ipo", "ipo ", "earnings", "largest company", "ai bubble", "stock market",
+        "ceo of", "valuation"]),
+    ("commodity", "大宗商品", [
+        "gold", "silver", "oil", "wti", "brent", "crude", "copper",
+        "natural gas", "opec", "xauusd", "wheat", "corn", "commodity"]),
+    ("geo", "地缘与政策", [
+        "china", "taiwan", "russia", "ukraine", "tariff", "iran", "nuclear deal",
+        "hormuz", "sanction", "trade deal", "shutdown", "invade", "ceasefire"]),
+]
+
+# 命中即判为噪声（即使命中了上面的关键词，体育类的奇怪措辞也先挡掉）
+NOISE = [
+    "nba", "nfl", "nhl", "mlb", "ufc", "lol:", "cs:", "dota", "counter-strike",
+    "champions league", "premier league", "la liga", "serie a", "big bash",
+    "grand prix", "superbowl", "playoff", "rookie of the year", "most valuable player",
+    " vs. ", " vs ", "gta", "oscar", "grammy", "eurovision", "tweets",
+    "divorce", "arrested", "jail", "dating", "married",
 ]
 
 
@@ -73,13 +85,35 @@ def num(d, *keys):
     return None
 
 
+DATE_RE = r"(20\d\d|january|february|march|april|june|july|august|september|october|november|december)"
+
+
 def classify(text):
+    """返回 (group_id, group_name)；None 表示不跟金融决策相关，丢弃"""
     t = " " + text.lower() + " "
+    for kw in NOISE:
+        if kw in t:
+            return None, None
     for gid, gname, kws in GROUPS:
         for kw in kws:
             if kw in t:
                 return gid, gname
-    return "other", "其他"
+    return None, None
+
+
+def detect_kind(ms):
+    """dist=互斥档位分布；ladder=按截止日的累计概率；single=单一二项"""
+    if len(ms) <= 1:
+        return "single"
+    subs = [(m.get("sub") or "") for m in ms]
+    hit = sum(1 for s in subs if re.search(DATE_RE, s.lower()))
+    if hit >= max(3, int(len(subs) * 0.6)):
+        probs = [m["prob"] for m in ms if m["prob"] is not None]
+        if len(probs) >= 3:
+            inc = sum(1 for a, b in zip(probs, probs[1:]) if b >= a - 1.0)
+            if inc >= len(probs) - 2:
+                return "ladder"
+    return "dist"
 
 
 def parse_market(m, event_title):
@@ -154,10 +188,13 @@ def main():
             json.dump(events[:2], f, ensure_ascii=False, indent=1)
 
     out = []
+    dropped = 0
     for e in events:
         title = (e.get("title") or "").strip()
-        desc = (e.get("description") or "")[:400]
-        gid, gname = classify(title + " " + desc)
+        gid, gname = classify(title)
+        if not gid:
+            dropped += 1
+            continue
         mkts = []
         for m in (e.get("markets") or []):
             if m.get("closed"):
@@ -168,22 +205,26 @@ def main():
             mkts.append(pm)
         if not mkts:
             continue
-        mkts.sort(key=lambda x: -(x["vol24"] or 0))
+        kind = detect_kind(mkts)
+        if kind == "dist":
+            mkts.sort(key=lambda x: -(x["prob"] or 0))
+        else:
+            mkts.sort(key=lambda x: (x.get("ends") or "9999"))
         out.append({
             "id": e.get("id"),
             "title": title,
             "slug": e.get("slug") or "",
             "group": gid,
             "groupName": gname,
+            "kind": kind,
             "vol24": num(e, "volume24hr", "volume24Hr"),
             "vol": num(e, "volumeNum", "volume"),
             "liq": num(e, "liquidityNum", "liquidity"),
             "ends": (e.get("endDate") or "")[:10],
-            "commentCount": e.get("commentCount"),
-            "markets": mkts,
+            "markets": mkts[:12],
         })
 
-    out = [x for x in out if x["group"] != "crypto"]
+    log("过滤：保留 %d，丢弃噪声 %d" % (len(out), dropped))
     out.sort(key=lambda x: -(x["vol24"] or 0))
 
     now = datetime.now(timezone.utc)
