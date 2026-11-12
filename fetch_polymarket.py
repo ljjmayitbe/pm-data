@@ -289,7 +289,53 @@ def translate_titles(titles):
     return cache
 
 
-# 与 A 股关联度低的直接剔除（俄乌/北约的纯战事、纯政治人物变动）
+# 同一件事常被拆成多个到期日的市场（12月决议/1月决议/3月决议），
+# 或同一标的的多个问法（市值/日期/募资额）。按主题聚类后只保留最近一期。
+TOPICS = [
+    # 美联储：决议 / 降息次数 / 加息次数 / 利率水平 各算一件
+    ('fed_decision', ['fed decision']),
+    ('fed_cuts',     ['rate cut']),
+    ('fed_hikes',    ['rate hike']),
+    ('fed_level',    ['fed rate be', 'fed rate at the end']),
+    # 公司：IPO 的问法与市值/其他分开，避免把 "IPO 哪天" 和 "收盘市值" 混成一件事
+    ('anthropic_ipo', ['anthropic ipo', 'anthropic’s ipo', "anthropic's ipo",
+                       'anthropic raise', 'anthropic’s valuation', "anthropic's valuation"]),
+    ('anthropic_other', ['anthropic']),
+    ('openai_ipo',   ['openai']),
+    ('nvidia_price', ['nvidia (nvda)', 'nvda)', 'nvda ']),
+    ('nvidia_other', ['nvidia']),
+    ('largest_company', ['largest company']),
+    ('largest_ipo',  ['largest ipo', 'ipos before']),
+    # 大宗
+    ('gold',         ['gold']),
+    ('wti',          ['wti']),
+    ('crude_other',  ['crude oil', 'oil pipeline']),
+    # 地缘：按「事件类型」聚类，不按国家，避免把停火、封锁、选举混为一谈
+    ('hormuz_shipping', ['shipping successfully targeted', 'iran target oman']),
+    ('hormuz_traffic',  ['hormuz traffic', 'hormuz agreement', 'hormuz management']),
+    ('iran_blockade',   ['iranian blockade']),
+    ('iran_nuclear',    ['nuclear deal']),
+    ('iran_invade',     ['invade iran']),
+    ('iran_airspace',   ['airspace closure']),
+    ('iran_ceasefire',  ['iran ceasefire', 'israel x iran', 'effective ceasefire']),
+    ('taiwan_invasion', ['invade taiwan']),
+    ('taiwan_election', ['taiwanese local elections', 'taiwan']),
+    ('russia_diesel',   ['russian diesel']),
+    ('russia_energy',   ['energy ceasefire']),
+    ('russia_other',    ['russia', 'ukraine', 'kyiv', 'nato']),
+    ('ai_bubble',       ['ai bubble']),
+    ('trump_china',     ['trump leave china']),
+    ('shutdown',        ['government shutdown']),
+]
+
+
+def topic_of(title):
+    """给事件分配主题 id；返回 None 表示这是独立事件，不参与聚类去重"""
+    t = ' ' + title.lower() + ' '
+    for tid, keys in TOPICS:
+        if any(k in t for k in keys):
+            return tid
+    return None
 def is_relevant(gid, title):
     if gid in ('fed', 'equity', 'commodity'):
         return True
@@ -426,6 +472,29 @@ def main():
         })
 
     log("过滤：保留 %d，噪声 %d，与A股无关 %d" % (len(out), dropped, irrelevant))
+
+    # 同主题去重：只留「最近一个尚未到期」的那期；已过期的排最后，同日则留下注最大的
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    def pick_key(x):
+        ends = x.get("ends") or "9999"
+        return (0 if ends >= today else 1, ends, -(x.get("vol24") or 0))
+
+    before = len(out)
+    picked = {}
+    solo = []
+    for x in out:
+        tid = topic_of(x["title"])
+        x["topic"] = tid
+        if not tid:
+            solo.append(x)
+            continue
+        cur = picked.get(tid)
+        if cur is None or pick_key(x) < pick_key(cur):
+            picked[tid] = x
+    out = solo + list(picked.values())
+    log("同主题去重：%d → %d（合并 %d 个重复主题）" % (before, len(out), before - len(out)))
+
     out.sort(key=lambda x: -(x["vol24"] or 0))
 
     # 标题中文化：人工固定译法 > 剥尾巴机翻主干 + 中文后缀
