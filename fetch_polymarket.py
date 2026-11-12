@@ -145,6 +145,171 @@ def date_key(s):
 # Polymarket 有一类未公开选项用占位符，价格恒为 50%，是噪声不是信号
 PLACEHOLDER = re.compile(r'^(candidate|company|option|team|person|entity|model)\s+[a-z0-9]{1,2}$', re.I)
 
+MON_CN = {'january': '1月', 'february': '2月', 'march': '3月', 'april': '4月',
+          'may': '5月', 'june': '6月', 'july': '7月', 'august': '8月',
+          'september': '9月', 'october': '10月', 'november': '11月', 'december': '12月'}
+
+
+def zh_date(s):
+    """'December 31' -> '12月31日'；'March 31, 2027' -> '2027年3月31日'"""
+    m = RE_DATE.search(s or "")
+    if not m:
+        return s
+    mon = MON_CN[m.group(1).lower()]
+    day = m.group(2)
+    if m.group(3):
+        return '%s年%s%s日' % (m.group(3), mon, day)
+    return '%s%s日' % (mon, day)
+
+
+def zh_sub(s):
+    """概率档位名中文化：优先规则（术语固定，比机翻准），识别不了就返回原文"""
+    t = (s or '').strip()
+    if not t:
+        return t
+    # 纯日期
+    if re.fullmatch(r'[A-Za-z]+ \d{1,2}(,? \d{4})?', t):
+        return zh_date(t)
+    # 基点
+    t2 = re.sub(r'(\d+)\+\s*bps\s+increase', r'加息\1基点以上', t, flags=re.I)
+    t2 = re.sub(r'(\d+)\+\s*bps\s+decrease', r'降息\1基点以上', t2, flags=re.I)
+    t2 = re.sub(r'(\d+)\s*bps\s+increase', r'加息\1个基点', t2, flags=re.I)
+    t2 = re.sub(r'(\d+)\s*bps\s+decrease', r'降息\1个基点', t2, flags=re.I)
+    if t2 != t:
+        return t2
+    low = t.lower()
+    fixed = {
+        'no change': '不变', 'yes': '是', 'no': '否',
+        'resigned/removed; over $4t': '辞职/免职 且 市值>4T',
+        'resigned/removed; under $4t': '辞职/免职 且 市值<4T',
+        'not resigned/removed; over $4t': '未辞职 且 市值>4T',
+        'not resigned/removed; under $4t': '未辞职 且 市值<4T',
+    }
+    if low in fixed:
+        return fixed[low]
+    return t
+
+
+# 阶梯型标题常以 "by...?" / "through...?" 结尾，机翻会把 by 译成"通过"，语义全错。
+# 做法：先剥掉这个尾巴，只译主干，再自己补回中文后缀。
+TAIL_RE = re.compile(r'\s+(by|through|on|before)\s*[\.。…_]*\s*\??\s*\??$', re.I)
+TAIL_CN = {'by': '（什么时候？）', 'before': '（什么时候之前？）',
+           'through': '（能持续到什么时候？）', 'on': '（哪一天？）'}
+
+
+def strip_tail(t):
+    m = TAIL_RE.search(t)
+    if m:
+        return t[:m.start()].rstrip(), TAIL_CN.get(m.group(1).lower(), '')
+    return t, ''
+
+
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'zh_cache.json')
+
+# 高频事件的固定译法（机翻对同一句式译法不统一，这里人工钉死）
+OVERRIDE = {
+    'Fed Decision in December?': '美联储 12 月利率决议',
+    'Fed Decision in January?': '美联储 1 月利率决议',
+    'Fed Decision in March?': '美联储 3 月利率决议',
+    'How many Fed rate cuts in 2026?': '2026 年美联储降息几次',
+    'How many Fed rate hikes in 2026?': '2026 年美联储加息几次',
+    'What will the Fed rate be at the end of 2026?': '2026 年底美联储利率到多少',
+    'Another Fed rate hike in 2026?': '2026 年会不会再加息一次',
+    'Largest Company end of December 2026?': '2026 年 12 月底全球最大市值公司',
+    'Largest Company end of November 2026?': '2026 年 11 月底全球最大市值公司',
+    '3rd Largest Company end of December 2026?': '2026 年 12 月底全球第三大市值公司',
+    'AI bubble burst by...?': 'AI 泡沫何时破裂',
+    'Anthropic IPO Closing Market Cap': 'Anthropic IPO 收盘市值',
+    'Anthropic IPO Closing Market Cap (Middle Brackets)': 'Anthropic IPO 收盘市值（中间档）',
+    "Will Anthropic's valuation hit __ by December 31?": 'Anthropic 估值年底前能突破多少',
+    'What will Anthropic\'s IPO valuation be?': 'Anthropic IPO 估值落在哪个区间',
+    'How much will Anthropic raise in its IPO?': 'Anthropic IPO 募资多少',
+    'Anthropic IPO by __?': 'Anthropic 什么时候 IPO',
+    'Anthropic IPO Date': 'Anthropic IPO 具体日期',
+    'OpenAI IPO Closing Market Cap': 'OpenAI IPO 收盘市值',
+    'Next CEO of NVIDIA?': '英伟达下一任 CEO 是谁',
+    "Nvidia's Market Cap end of 2026?": '2026 年底英伟达市值',
+    'What will NVIDIA (NVDA) hit in November 2026?': '11 月英伟达股价能到多少',
+    'What will NVIDIA (NVDA) hit Week of November 9 2026?': '本周英伟达股价能到多少',
+    'Will NVIDIA (NVDA) close above ___ end of November?': '11 月底英伟达能收在多少之上',
+    'What will Gold (XAUUSD) hit in November 2026?': '11 月黄金能到多少',
+    'What will Gold (GC) hit__ by end of December?': '年底前黄金能到多少',
+    'What will WTI Crude Oil (WTI) hit in November 2026?': '11 月 WTI 原油能到多少',
+    'Crude Oil all time high by...?': '原油何时创历史新高',
+    'Will China invade Taiwan by December 31, 2027?': '中国会不会在 2027 年底前武统台湾',
+    'Will China invade Taiwan by June 30, 2027?': '中国会不会在 2027 年 6 月底前武统台湾',
+    'Will China invade Taiwan by end of 2026?': '中国会不会在 2026 年底前武统台湾',
+    '2026 Taiwanese Local Elections: Party Winner': '2026 台湾地方选举哪个党赢',
+    'IPOs before 2027?': '2027 年前有哪些公司 IPO',
+    'Largest IPO by market cap in 2026?': '2026 年最大 IPO 是哪家',
+    'Jensen Huang resigned or removed & Nvidia above $4T end of 2026?': '黄仁勋去职 × 英伟达年底市值能否守住 4 万亿',
+    'Will the U.S. invade Iran before 2027?': '美国会不会在 2027 年前入侵伊朗',
+    'US announces end of Iranian blockade by...?': '美国何时宣布解除对伊朗封锁',
+    'Strait of Hormuz traffic returns to normal by December 31?': '霍尔木兹海峡年底前能否恢复正常通航',
+    'Strait of Hormuz traffic returns to normal by November 30?': '霍尔木兹海峡 11 月底前能否恢复正常通航',
+}
+
+
+def translate_titles(titles):
+    """标题机翻（MyMemory 免费接口），结果永久缓存，只在遇到新标题时才请求"""
+    cache = {}
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, encoding='utf-8') as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+    todo = [t for t in titles if t and t not in cache]
+    quota_dead = False
+    for t in todo:
+        if quota_dead:
+            break
+        try:
+            r = requests.get('https://api.mymemory.translated.net/get',
+                             params={'q': t[:480], 'langpair': 'en|zh-CN'},
+                             headers=UA, timeout=15)
+            j = r.json()
+            zh = ((j.get('responseData') or {}).get('translatedText') or '').strip()
+            if 'MYMEMORY WARNING' in zh.upper() or 'QUOTA' in zh.upper():
+                quota_dead = True
+                log('  翻译额度用尽，剩余条目保留英文')
+                continue
+            if zh:
+                cache[t] = zh
+        except Exception:
+            pass
+        time.sleep(0.25)
+    if todo:
+        try:
+            with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, ensure_ascii=False, indent=1)
+            log('  翻译：新增 %d 条，缓存共 %d 条' % (len(todo), len(cache)))
+        except Exception as e:
+            log('  翻译缓存写入失败 %s' % e)
+    return cache
+
+
+# 与 A 股关联度低的直接剔除（俄乌/北约的纯战事、纯政治人物变动）
+def is_relevant(gid, title):
+    if gid in ('fed', 'equity', 'commodity'):
+        return True
+    t = ' ' + title.lower() + ' '
+    # 俄罗斯/乌克兰/北约：只有牵涉能源才留
+    if any(k in t for k in ('russia', 'ukraine', 'kyiv', 'putin', 'nato')):
+        return any(k in t for k in (' oil', 'diesel', 'energy', 'gas'))
+    # 纯政治人物/外交日程：删
+    if any(k in t for k in ('regime fall', 'leadership change', 'diplomatic meeting',
+                            'iran leader end', 'what will be in a us-iran deal')):
+        return False
+    # 中国/台海：留
+    if any(k in t for k in ('china', 'taiwan', 'chinese')):
+        return True
+    # 伊朗/霍尔木兹/原油供应链：留（直接影响油价 → A股石化）
+    if any(k in t for k in ('iran', 'hormuz', 'oil', 'crude', 'opec',
+                            'blockade', 'pipeline', 'airspace', 'diesel')):
+        return True
+    return False
+
 
 def parse_market(m, event_title):
     outs = jlist(m.get("outcomes"))
@@ -219,11 +384,15 @@ def main():
 
     out = []
     dropped = 0
+    irrelevant = 0
     for e in events:
         title = (e.get("title") or "").strip()
         gid, gname = classify(title)
         if not gid:
             dropped += 1
+            continue
+        if not is_relevant(gid, title):
+            irrelevant += 1
             continue
         mkts = []
         for m in (e.get("markets") or []):
@@ -256,8 +425,27 @@ def main():
             "markets": mkts[:12],
         })
 
-    log("过滤：保留 %d，丢弃噪声 %d" % (len(out), dropped))
+    log("过滤：保留 %d，噪声 %d，与A股无关 %d" % (len(out), dropped, irrelevant))
     out.sort(key=lambda x: -(x["vol24"] or 0))
+
+    # 标题中文化：人工固定译法 > 剥尾巴机翻主干 + 中文后缀
+    cores, tails = [], {}
+    for x in out:
+        if x["title"] in OVERRIDE:
+            continue
+        core, tail = strip_tail(x["title"])
+        tails[x["title"]] = tail
+        cores.append(core)
+    zh = translate_titles(cores)
+    for x in out:
+        if x["title"] in OVERRIDE:
+            x["title_zh"] = OVERRIDE[x["title"]]
+        else:
+            core, _ = strip_tail(x["title"])
+            base = (zh.get(core) or "").strip()
+            x["title_zh"] = (base + tails.get(x["title"], "")) if base else ""
+        for m in x["markets"]:
+            m["sub_zh"] = zh_sub(m.get("sub") or "")
 
     now = datetime.now(timezone.utc)
     snap = {
